@@ -10,6 +10,11 @@
 Без окна: RFDETR_LIVE_HEADLESS=1 python rfdetr_live_seg.py
 
 Чекпоинт: SEG_CHECKPOINT_PATH (веса сегментации, не bbox-only).
+
+DOWN-логика (занос):
+  Дверь должна пересечь ВЕРХНЮЮ линию (STATIC_TRIPWIRE_LINE_NORM) сверху вниз,
+  а затем пересечь НИЖНЮЮ линию (STATIC_TRIPWIRE_DOWN_LINE_NORM) сверху вниз.
+  Только после пересечения обеих линий засчитывается событие DOWN.
 """
 
 from __future__ import annotations
@@ -37,9 +42,16 @@ if not hasattr(cv2, "CV_8U"):
 
 import rfdetr_video_events as rv
 
+# Верхняя линия — для UP (вынос) и первый порог DOWN (занос)
 STATIC_TRIPWIRE_LINE_NORM: list[tuple[float, float]] = [
     (0.172653, 0.561082),
     (0.475232, 0.424178),
+]
+
+# Нижняя линия — второй порог DOWN (занос). Дверь должна пересечь её ПОСЛЕ верхней.
+STATIC_TRIPWIRE_DOWN_LINE_NORM: list[tuple[float, float]] = [
+    (0.170274, 0.838710),
+    (0.653457, 0.548387),
 ]
 
 
@@ -60,7 +72,6 @@ except ImportError:
     HAS_PYQT = False
 
 # ---------- источник (выбери один) ----------
-# int — USB-камера; str — один RTSP/путь; list[str|int] — несколько потоков подряд.
 LIVE_SOURCE_URLS: list[str] = [
     # "rtsp://viewer:ViewerPass_9347X@94.41.120.115:8554/cam44",
     # "rtsp://viewer:ViewerPass_9347X@94.41.120.115:8554/cam47",
@@ -90,22 +101,15 @@ LOOP_VIDEO_FILE = False
 DETECT_EVERY_N = 1
 SHOW_TRIPWIRE = True
 
-# Папка с видео / один .mp4: замедление прокрутки (RTSP и камеры из списка — без этого)
-FILE_PLAYBACK_SLOWDOWN = 2.0  # множитель паузы между кадрами (>1 — медленнее)
-FILE_PLAYBACK_CAP_FPS = 18.0  # не быстрее этого FPS по таймеру (часто завышено в метаданных)
+FILE_PLAYBACK_SLOWDOWN = 2.0
+FILE_PLAYBACK_CAP_FPS = 18.0
 
 ALSO_SAVE_MP4 = False
 MP4_OUTPUT = Path(__file__).resolve().parent / "recordings_2/cam0"
 
 # ---------- логи и сохранение кадров ----------
-# Для каждого запуска создаётся папка run_YYYY-mm-dd_HH-MM-SS с:
-#   run_info.txt      — источник и настройки
-#   detections.jsonl  — одна строка JSON на «отчётный» кадр (см. ниже)
-#   annotated_*.jpg   — если включено сохранение картинок
 LIVE_RUN_ROOT = Path(__file__).resolve().parent / "rfdetr_live_logs_0"
-# Каждые N кадров: сообщение в консоль + строка в jsonl (0 = отключить периодику)
 LOG_EVERY_N_FRAMES = 10
-# Сохранять размеченный кадр JPEG каждые N кадров (0 = не сохранять изображения)
 SAVE_ANNOTATED_JPEG_EVERY_N = 0
 
 # ---------- debug / relaxed live event logic ----------
@@ -116,23 +120,25 @@ LIVE_RELAXED_ROI_EXPAND_X = 0.45
 LIVE_RELAXED_ROI_EXPAND_Y = 0.28
 LIVE_RELAXED_MAX_PERSON_CENTER_DIST_FACTOR = 1.55
 
+LIVE_MIN_UP_TRAVEL_PX = 24.0
+LIVE_MIN_DOWN_TRAVEL_PX = 14.0   # для DOWN немного мягче — дверь при заносе двигается компактнее
+LIVE_MOVE_WINDOW_FRAMES = 8
+
+LIVE_REQUIRED_BELOW_FRAMES = 2
+LIVE_REQUIRED_ABOVE_FRAMES = 1   # для DOWN мягче: на улице трек нестабилен
+
 # ---------- стабилизация класса события ----------
-# Класс события определяется по последним N кадрам истории трека.
 EVENT_CLASS_WINDOW = 7
 
-# ---------- фильтр минимального размера для door/trim (на момент события) ----------
-# split_detections() уже отсекает совсем мелочь (rv.MIN_PRIMARY_*). Здесь — порог «достаточно
-# крупный бокс для засчёта», иначе далёкая дверь (низкий bbox) никогда не попадёт в трек.
+# ---------- фильтр минимального размера ----------
 MIN_DOOR_WIDTH_PX = 60
-MIN_DOOR_HEIGHT_PX = 80  # далёкая дверь: h bbox часто 90–99 px
+MIN_DOOR_HEIGHT_PX = 80
 MIN_DOOR_AREA_PX2 = 6500
 
 MIN_TRIM_WIDTH_PX = 20
 MIN_TRIM_HEIGHT_PX = 80
 MIN_TRIM_AREA_PX2 = 2500
 
-# Если True — до трекинга повторно режем по MIN_DOOR_* / MIN_TRIM_* (дубль после split_detections).
-# False: в трек идут те же primary, что и в rfdetr_video_events; мелочь по-прежнему отсекается при EVENT.
 FILTER_SMALL_OBJECTS_BEFORE_TRACKING = False
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm"}
@@ -173,10 +179,6 @@ def _expand_sources(src) -> list:
 
 
 def _try_open_video_capture(src) -> cv2.VideoCapture | None:
-    """
-    Открывает камеру (индекс), файл или RTSP/URL.
-    Для числового индекса на Linux дополнительно пробует CAP_V4L2, если бэкенд по умолчанию не сработал.
-    """
     if isinstance(src, int):
         cap = cv2.VideoCapture(src)
         if cap.isOpened():
@@ -196,7 +198,6 @@ def _try_open_video_capture(src) -> cv2.VideoCapture | None:
 
 
 def _format_capture_open_error(src) -> str:
-    """Сообщение в лог, если источник не открылся."""
     lines = [
         f"Не удалось открыть источник {src!r}.",
     ]
@@ -262,7 +263,6 @@ def _build_seg_model(checkpoint_path: str, num_classes: int) -> RFDETRSegMedium:
 
 
 def _load_frame_detections_seg(model, frame, class_names: list[str]) -> list:
-    """Детекции для пайплайна событий; при Seg добавляется mask [H,W] bool."""
     detections = model.predict(rv.frame_to_model_rgb(frame), threshold=rv.CONF_THRESHOLD)
     result = []
     if detections is None or len(detections.xyxy) == 0:
@@ -301,6 +301,8 @@ def _annotate_frame(
     frame: np.ndarray,
     last_dets: list,
     frame_idx: int,
+    line_px=None,
+    line_down_px=None,
 ) -> np.ndarray:
     h, w = frame.shape[:2]
     vis = frame.copy()
@@ -328,15 +330,27 @@ def _annotate_frame(
         for d in last_dets:
             label = f"{d['class_name']} {d['confidence']:.2f}"
             rv.draw_box_with_label(vis, d["box"], label, _color_bgr(d["class_name"]), thickness=2)
+
     if SHOW_TRIPWIRE:
-        line_px = rv.denorm_line(STATIC_TRIPWIRE_LINE_NORM, w, h)
-        cv2.line(
-            vis,
-            tuple(line_px[0].astype(int)),
-            tuple(line_px[1].astype(int)),
-            (255, 255, 255),
-            2,
-        )
+        # Верхняя линия (UP / первый порог DOWN) — белая
+        if line_px is not None:
+            cv2.line(
+                vis,
+                tuple(line_px[0].astype(int)),
+                tuple(line_px[1].astype(int)),
+                (255, 255, 255),
+                2,
+            )
+        # Нижняя линия (второй порог DOWN) — жёлтая
+        if line_down_px is not None:
+            cv2.line(
+                vis,
+                tuple(line_down_px[0].astype(int)),
+                tuple(line_down_px[1].astype(int)),
+                (0, 255, 255),
+                2,
+            )
+
     cv2.putText(
         vis,
         f"frame {frame_idx} | dets {len(last_dets)}",
@@ -352,9 +366,8 @@ def _annotate_frame(
 
 def _new_run_dir() -> Path:
     LIVE_RUN_ROOT.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = LIVE_RUN_ROOT / f"run_{stamp}"
-    run_dir.mkdir(parents=False)
+    run_dir = LIVE_RUN_ROOT / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
 
 
@@ -394,11 +407,18 @@ def _source_stem(src) -> str:
     return p.name or "live"
 
 
+def _recording_mp4_path(
+        current_src: int | str,
+        sources: list,
+        events_dir: Path,
+        single_video_file_out: Path,
+) -> Path:
+    if len(sources) == 1 and _is_video_file(current_src):
+        return single_video_file_out
+    return events_dir / f"{_source_stem(current_src)}.mp4"
+
+
 def _tracking_group_name(class_name: str) -> str:
-    """
-    Для трекинга объединяем door и trim в одну группу,
-    чтобы кратковременная смена класса не рвала трек.
-    """
     if class_name in {rv.DOOR_CLASS_NAME, rv.TRIM_CLASS_NAME}:
         return "door_trim_group"
     return class_name
@@ -483,9 +503,15 @@ class LiveEventProcessor:
         self.events_dir = run_dir / self.source_stem
         self.events_dir.mkdir(parents=True, exist_ok=True)
 
+        # Верхняя линия (UP + первый порог DOWN)
         self.line = None
         self.top_side_sign_value = None
         self.bottom_side_sign_value = None
+
+        # Нижняя линия (второй порог DOWN)
+        self.line_down = None
+        self.top_side_sign_value_down = None
+        self.bottom_side_sign_value_down = None
 
         self.tracks = []
         self.next_track_id = 0
@@ -507,9 +533,19 @@ class LiveEventProcessor:
             self.bottom_side_sign_value,
         ) = rv.infer_top_bottom_sides(w, h, self.line)
 
+        self.line_down = rv.denorm_line(STATIC_TRIPWIRE_DOWN_LINE_NORM, w, h)
+        (
+            self.top_side_sign_value_down,
+            self.bottom_side_sign_value_down,
+        ) = rv.infer_top_bottom_sides(w, h, self.line_down)
+
     def annotate_frame(self, frame: np.ndarray, all_dets: list, frame_idx: int) -> np.ndarray:
         self._ensure_line(frame)
-        return _annotate_frame(frame, all_dets, frame_idx)
+        return _annotate_frame(frame, all_dets, frame_idx, self.line, self.line_down)
+
+    # ------------------------------------------------------------------ #
+    #  Вспомогательные методы для ВЕРХНЕЙ линии
+    # ------------------------------------------------------------------ #
 
     def _is_clearly_below(self, box) -> bool:
         metrics = self._box_line_metrics(box)
@@ -519,17 +555,15 @@ class LiveEventProcessor:
         metrics = self._box_line_metrics(box)
         return metrics["state"] == "above" or metrics["center_d"] < -LIVE_LINE_MARGIN_PX
 
-    def _signed_distance_to_line(self, point: np.ndarray) -> float:
-        a, b = self.line
+    def _signed_distance_to_line(self, point: np.ndarray, line) -> float:
+        a, b = line
         line_len = float(np.linalg.norm(b - a))
         if line_len < 1e-6:
             return 0.0
         return float(rv.side_of_line(point, a, b) / line_len)
 
-    def _segment_intersects_box(self, box) -> bool:
-        """True, если отрезок tripwire реально задевает прямоугольник bbox.
-        Защита от ложных «intersects» по продолжению бесконечной прямой за пределы отрезка."""
-        if self.line is None:
+    def _segment_intersects_box(self, box, line) -> bool:
+        if line is None:
             return False
         x1, y1, x2, y2 = map(float, box)
         if x2 <= x1 or y2 <= y1:
@@ -540,20 +574,24 @@ class LiveEventProcessor:
             max(1, int(round(x2 - x1))),
             max(1, int(round(y2 - y1))),
         )
-        a = (int(round(float(self.line[0][0]))), int(round(float(self.line[0][1]))))
-        b = (int(round(float(self.line[1][0]))), int(round(float(self.line[1][1]))))
+        a = (int(round(float(line[0][0]))), int(round(float(line[0][1]))))
+        b = (int(round(float(line[1][0]))), int(round(float(line[1][1]))))
         retval, _, _ = cv2.clipLine(rect, a, b)
         return bool(retval)
 
     def _bottom_distance(self, box) -> float:
         point = rv.box_bottom_center(box)
-        return self._signed_distance_to_line(point) * float(self.bottom_side_sign_value)
+        return self._signed_distance_to_line(point, self.line) * float(self.bottom_side_sign_value)
 
     def _center_distance(self, box) -> float:
         point = rv.center(box)
-        return self._signed_distance_to_line(point) * float(self.bottom_side_sign_value)
+        return self._signed_distance_to_line(point, self.line) * float(self.bottom_side_sign_value)
 
     def _box_line_metrics(self, box) -> dict:
+        return self._box_line_metrics_for(box, self.line, self.bottom_side_sign_value)
+
+    def _box_line_metrics_for(self, box, line, bottom_sign) -> dict:
+        """Универсальный расчёт метрик для произвольной линии."""
         x1, y1, x2, y2 = map(float, box)
         points = [
             np.array([x1, y1], dtype=np.float32),
@@ -562,11 +600,13 @@ class LiveEventProcessor:
             np.array([x2, y2], dtype=np.float32),
         ]
         distances = [
-            self._signed_distance_to_line(p) * float(self.bottom_side_sign_value)
+            self._signed_distance_to_line(p, line) * float(bottom_sign)
             for p in points
         ]
-        center_d = self._center_distance(box)
-        bottom_d = self._bottom_distance(box)
+        center_pt = rv.center(box)
+        center_d = self._signed_distance_to_line(center_pt, line) * float(bottom_sign)
+        bottom_pt = rv.box_bottom_center(box)
+        bottom_d = self._signed_distance_to_line(bottom_pt, line) * float(bottom_sign)
 
         min_d = min(distances)
         max_d = max(distances)
@@ -577,7 +617,7 @@ class LiveEventProcessor:
         else:
             state = "intersects"
 
-        if state == "intersects" and not self._segment_intersects_box(box):
+        if state == "intersects" and not self._segment_intersects_box(box, line):
             state = "below" if center_d > 0.0 else "above"
 
         return {
@@ -587,6 +627,158 @@ class LiveEventProcessor:
             "center_d": float(center_d),
             "bottom_d": float(bottom_d),
         }
+
+    # ------------------------------------------------------------------ #
+    #  Вспомогательные методы для НИЖНЕЙ линии
+    # ------------------------------------------------------------------ #
+
+    def _box_line_metrics_down(self, box) -> dict:
+        return self._box_line_metrics_for(box, self.line_down, self.bottom_side_sign_value_down)
+
+    def _is_clearly_above_down_line(self, box) -> bool:
+        """Объект явно выше нижней линии (ещё не пересёк её)."""
+        metrics = self._box_line_metrics_down(box)
+        return metrics["state"] == "above" or metrics["center_d"] < -LIVE_LINE_MARGIN_PX
+
+    def _is_clearly_below_down_line(self, box) -> bool:
+        """Объект явно ниже нижней линии (уже прошёл через неё)."""
+        metrics = self._box_line_metrics_down(box)
+        return metrics["state"] == "below" or metrics["center_d"] > LIVE_LINE_MARGIN_PX
+
+    # ------------------------------------------------------------------ #
+    #  Перемещение трека
+    # ------------------------------------------------------------------ #
+
+    def _recent_y_travel(self, track) -> float:
+        hist = track.get("history", [])
+        if len(hist) < 2:
+            return 0.0
+        window = hist[-LIVE_MOVE_WINDOW_FRAMES:]
+        if len(window) < 2:
+            return 0.0
+        y_first = float(rv.center(window[0]["box"])[1])
+        y_last = float(rv.center(window[-1]["box"])[1])
+        return y_first - y_last
+
+    # ------------------------------------------------------------------ #
+    #  UP: пересечение верхней линии снизу вверх
+    # ------------------------------------------------------------------ #
+
+    def _track_started_below_relaxed(self, track) -> bool:
+        if "ever_below" in track:
+            return bool(track["ever_below"])
+        return any(self._is_clearly_below(item["box"]) for item in track["history"])
+
+    def _crossed_line_from_below_relaxed(self, track) -> bool:
+        if len(track["history"]) < 2:
+            return False
+
+        prev_metrics = self._box_line_metrics(track["history"][-2]["box"])
+        curr_metrics = self._box_line_metrics(track["history"][-1]["box"])
+        prev_center_d = prev_metrics["center_d"]
+        curr_center_d = curr_metrics["center_d"]
+
+        if not (
+                track.get("ever_below", False)
+                and prev_metrics["state"] in {"below", "intersects"}
+                and curr_metrics["state"] == "intersects"
+                and prev_center_d > 0.0
+                and curr_center_d <= 0.0
+                and curr_center_d < prev_center_d
+        ):
+            return False
+
+        if track.get("below_frames", 0) < LIVE_REQUIRED_BELOW_FRAMES:
+            return False
+
+        if self._recent_y_travel(track) < LIVE_MIN_UP_TRAVEL_PX:
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------ #
+    #  DOWN: двухлинейная логика (занос)
+    #
+    #  Условие:
+    #    1. Трек когда-либо был выше верхней линии  (ever_above_upper)
+    #    2. Трек пересёк верхнюю линию сверху вниз  (crossed_upper_down)
+    #    3. Трек пересёк нижнюю линию сверху вниз   (crossed_lower_down)
+    #
+    #  Порядок: сначала верхняя, потом нижняя.
+    #  Флаги хранятся в треке, чтобы не считать повторно.
+    # ------------------------------------------------------------------ #
+
+    def _is_clearly_above_upper(self, box) -> bool:
+        metrics = self._box_line_metrics(box)
+        return metrics["state"] == "above" or metrics["center_d"] < -LIVE_LINE_MARGIN_PX
+
+    def _update_down_stage_flags(self, track: dict, frame_idx: int) -> None:
+        """
+        Обновляет флаги прохождения этапов DOWN в треке.
+        Вызывается каждый кадр после обновления истории.
+        """
+        box = track["box"]
+
+        # --- Этап 0: трек хоть раз был явно выше верхней линии ---
+        if not track.get("down_ever_above_upper", False):
+            if self._is_clearly_above_upper(box):
+                track["down_ever_above_upper"] = True
+
+        # --- Этап 1: пересечение верхней линии сверху вниз ---
+        if track.get("down_ever_above_upper", False) and not track.get("down_crossed_upper", False):
+            hist = track.get("history", [])
+            if len(hist) >= 2:
+                pm = self._box_line_metrics(hist[-2]["box"])
+                cm = self._box_line_metrics(hist[-1]["box"])
+                # центр перешёл с "above" на "intersects/below"
+                if (
+                    pm["center_d"] < 0.0
+                    and cm["center_d"] >= 0.0
+                    and pm["state"] in {"above", "intersects"}
+                    and cm["state"] in {"intersects", "below"}
+                ):
+                    if track.get("above_frames_upper", 0) >= LIVE_REQUIRED_ABOVE_FRAMES:
+                        travel = -self._recent_y_travel(track)  # движение вниз → travel > 0
+                        if travel >= LIVE_MIN_DOWN_TRAVEL_PX:
+                            track["down_crossed_upper"] = True
+                            track["down_crossed_upper_frame"] = frame_idx
+                            if LIVE_DEBUG_EVENT_DECISIONS:
+                                self.log(
+                                    f"[DOWN stage1] {self.source_name} track={track['id']} "
+                                    f"frame={frame_idx} пересёк ВЕРХНЮЮ линию ↓"
+                                )
+
+        # --- Этап 2: пересечение нижней линии сверху вниз (только после этапа 1) ---
+        if track.get("down_crossed_upper", False) and not track.get("down_crossed_lower", False):
+            hist = track.get("history", [])
+            if len(hist) >= 2:
+                pm_d = self._box_line_metrics_down(hist[-2]["box"])
+                cm_d = self._box_line_metrics_down(hist[-1]["box"])
+                if (
+                    pm_d["center_d"] < 0.0
+                    and cm_d["center_d"] >= 0.0
+                    and pm_d["state"] in {"above", "intersects"}
+                    and cm_d["state"] in {"intersects", "below"}
+                ):
+                    track["down_crossed_lower"] = True
+                    track["down_crossed_lower_frame"] = frame_idx
+                    if LIVE_DEBUG_EVENT_DECISIONS:
+                        self.log(
+                            f"[DOWN stage2] {self.source_name} track={track['id']} "
+                            f"frame={frame_idx} пересёк НИЖНЮЮ линию ↓ → READY"
+                        )
+
+    def _down_event_ready(self, track: dict) -> bool:
+        """True, если трек прошёл оба этапа и событие ещё не засчитано."""
+        return (
+            not track.get("counted_down", False)
+            and track.get("down_crossed_upper", False)
+            and track.get("down_crossed_lower", False)
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Поиск person для объекта
+    # ------------------------------------------------------------------ #
 
     def _find_best_person_for_object_live(self, obj_det, person_dets, frame_shape):
         best = rv.find_best_person_for_object(obj_det, person_dets, frame_shape)
@@ -614,15 +806,12 @@ class LiveEventProcessor:
             p_c = rv.center(p_box)
             if not (rx1 <= p_c[0] <= rx2 and ry1 <= p_c[1] <= ry2):
                 continue
-
             dist = float(np.linalg.norm(p_c - obj_c))
             if dist > obj_diag * LIVE_RELAXED_MAX_PERSON_CENTER_DIST_FACTOR:
                 continue
-
             overlap = rv.iou_xyxy(roi, p_box)
             pw, ph, parea = rv.box_wh_area(p_box)
             score = p["confidence"] * 1000.0 + parea * 0.01 - dist * 12.0 + overlap * 300.0
-
             if score > best_score:
                 best_score = score
                 best = {
@@ -638,88 +827,11 @@ class LiveEventProcessor:
 
         return _copy_person_info_with_mask(best, person_dets)
 
-    def _track_started_below_relaxed(self, track) -> bool:
-        if "ever_below" in track:
-            return bool(track["ever_below"])
-        return any(self._is_clearly_below(item["box"]) for item in track["history"])
-
-    def _crossed_line_from_below_relaxed(self, track) -> bool:
-        if len(track["history"]) < 2:
-            return False
-
-        prev_metrics = self._box_line_metrics(track["history"][-2]["box"])
-        curr_metrics = self._box_line_metrics(track["history"][-1]["box"])
-        prev_center_d = prev_metrics["center_d"]
-        curr_center_d = curr_metrics["center_d"]
-
-        if (
-                track.get("ever_below", False)
-                and prev_metrics["state"] in {"below", "intersects"}
-                and curr_metrics["state"] == "intersects"
-                and prev_center_d > 0.0
-                and curr_center_d <= 0.0
-                and curr_center_d < prev_center_d
-        ):
-            return True
-
-        return False
-
-    def _track_started_above_relaxed(self, track) -> bool:
-        if "ever_above" in track:
-            return bool(track["ever_above"])
-        return any(self._is_clearly_above(item["box"]) for item in track["history"])
-
-    def _crossed_line_from_above_relaxed(self, track) -> bool:
-        if len(track["history"]) < 2:
-            return False
-
-        prev_metrics = self._box_line_metrics(track["history"][-2]["box"])
-        curr_metrics = self._box_line_metrics(track["history"][-1]["box"])
-        prev_center_d = prev_metrics["center_d"]
-        curr_center_d = curr_metrics["center_d"]
-
-        if (
-                track.get("ever_above", False)
-                and prev_metrics["state"] in {"above", "intersects"}
-                and curr_metrics["state"] == "intersects"
-                and prev_center_d < 0.0
-                and curr_center_d >= 0.0
-                and curr_center_d > prev_center_d
-        ):
-            return True
-
-        return False
-
-    def _get_event_class_recent(self, track: dict, n: int = EVENT_CLASS_WINDOW) -> str:
-        """
-        Берём класс по последним N кадрам истории трека.
-        Если есть ничья — побеждает более свежий класс.
-        """
-        hist = track.get("history", [])
-        if not hist:
-            return track.get("class_name_current", track.get("tracking_group", "unknown"))
-
-        recent = hist[-n:]
-        cnt = Counter(item["class_name"] for item in recent if "class_name" in item)
-        if not cnt:
-            return track.get("class_name_current", track.get("tracking_group", "unknown"))
-
-        best_count = max(cnt.values())
-        candidates = {cls for cls, v in cnt.items() if v == best_count}
-
-        for item in reversed(recent):
-            cls = item.get("class_name")
-            if cls in candidates:
-                return cls
-
-        return recent[-1].get("class_name", track.get("class_name_current", "unknown"))
+    # ------------------------------------------------------------------ #
+    #  Evaluate UP (старая логика, без изменений)
+    # ------------------------------------------------------------------ #
 
     def _evaluate_track(self, track: dict) -> dict:
-        curr_person = None
-        hist_has_person = False
-        has_person = True
-        person_info = None
-
         prev_d = None
         prev_center_d = None
         prev_box_state = None
@@ -748,10 +860,10 @@ class LiveEventProcessor:
 
         return {
             "reason": reason,
-            "curr_person": curr_person,
-            "person_info": person_info,
-            "has_person": has_person,
-            "hist_has_person": hist_has_person,
+            "curr_person": None,
+            "person_info": None,
+            "has_person": True,
+            "hist_has_person": False,
             "prev_bottom_dist": prev_d,
             "curr_bottom_dist": curr_d,
             "prev_center_dist": prev_center_d,
@@ -766,60 +878,25 @@ class LiveEventProcessor:
             "relaxed_crossed": relaxed_crossed,
         }
 
-    def _evaluate_track_down(self, track: dict) -> dict:
-        curr_person = None
-        hist_has_person = False
-        has_person = True
-        person_info = None
-
-        prev_d = None
-        prev_center_d = None
-        prev_box_state = None
-        if len(track["history"]) >= 2:
-            prev_metrics = self._box_line_metrics(track["history"][-2]["box"])
-            prev_d = prev_metrics["bottom_d"]
-            prev_center_d = prev_metrics["center_d"]
-            prev_box_state = prev_metrics["state"]
-        curr_metrics = self._box_line_metrics(track["history"][-1]["box"])
-        curr_d = curr_metrics["bottom_d"]
-
-        relaxed_started_above = self._track_started_above_relaxed(track)
-        relaxed_crossed = self._crossed_line_from_above_relaxed(track)
-
-        reason = None
-        if track["counted_down"]:
-            reason = "ALREADY_COUNTED_DOWN"
-        elif len(track["history"]) < LIVE_MIN_TRACK_HISTORY:
-            reason = f"HISTORY_LT_{LIVE_MIN_TRACK_HISTORY}"
-        elif not relaxed_started_above:
-            reason = "NOT_STARTED_ABOVE_LINE"
-        elif not relaxed_crossed:
-            reason = "NO_CROSS_YET_DOWN"
-        else:
-            reason = "READY_EVENT_DOWN"
-
-        return {
-            "reason": reason,
-            "curr_person": curr_person,
-            "person_info": person_info,
-            "has_person": has_person,
-            "hist_has_person": hist_has_person,
-            "prev_bottom_dist": prev_d,
-            "curr_bottom_dist": curr_d,
-            "prev_center_dist": prev_center_d,
-            "curr_center_dist": curr_metrics["center_d"],
-            "prev_box_state": prev_box_state,
-            "curr_box_state": curr_metrics["state"],
-            "curr_box_min_d": curr_metrics["min_d"],
-            "curr_box_max_d": curr_metrics["max_d"],
-            "relaxed_started_above": relaxed_started_above,
-            "relaxed_crossed_down": relaxed_crossed,
-        }
+    def _get_event_class_recent(self, track: dict, n: int = EVENT_CLASS_WINDOW) -> str:
+        hist = track.get("history", [])
+        if not hist:
+            return track.get("class_name_current", track.get("tracking_group", "unknown"))
+        recent = hist[-n:]
+        cnt = Counter(item["class_name"] for item in recent if "class_name" in item)
+        if not cnt:
+            return track.get("class_name_current", track.get("tracking_group", "unknown"))
+        best_count = max(cnt.values())
+        candidates = {cls for cls, v in cnt.items() if v == best_count}
+        for item in reversed(recent):
+            cls = item.get("class_name")
+            if cls in candidates:
+                return cls
+        return recent[-1].get("class_name", track.get("class_name_current", "unknown"))
 
     def _log_track_decision(self, track: dict, frame_idx: int, eval_data: dict) -> None:
         if not LIVE_DEBUG_EVENT_DECISIONS:
             return
-
         ow, oh, oarea = rv.box_wh_area(track["box"])
         recent_event_class = self._get_event_class_recent(track)
         parts = [
@@ -840,6 +917,8 @@ class LiveEventProcessor:
             f"has_person={int(eval_data['has_person'])}",
             f"hist_person={int(eval_data['hist_has_person'])}",
             f"reason={eval_data['reason']}",
+            f"down_stage=upper:{int(track.get('down_crossed_upper', False))}"
+            f"/lower:{int(track.get('down_crossed_lower', False))}",
         ]
         if eval_data["prev_box_state"] is not None:
             parts.append(f"prev_box={eval_data['prev_box_state']}")
@@ -847,20 +926,6 @@ class LiveEventProcessor:
         if eval_data["prev_bottom_dist"] is not None:
             parts.append(f"prev_line_d={eval_data['prev_bottom_dist']:.1f}")
         parts.append(f"curr_line_d={eval_data['curr_bottom_dist']:.1f}")
-        if eval_data["prev_center_dist"] is not None:
-            parts.append(f"prev_center_d={eval_data['prev_center_dist']:.1f}")
-        parts.append(f"curr_center_d={eval_data['curr_center_dist']:.1f}")
-        parts.append(f"box_min_d={eval_data['curr_box_min_d']:.1f}")
-        parts.append(f"box_max_d={eval_data['curr_box_max_d']:.1f}")
-
-        person_info = eval_data["person_info"]
-        if person_info is not None:
-            parts.append(f"person_dist={person_info['center_dist']:.1f}")
-            parts.append(f"person_wh={person_info['w']}x{person_info['h']}")
-            parts.append(f"person_conf={person_info['confidence']:.2f}")
-            if person_info.get("relaxed"):
-                parts.append("person_match=relaxed")
-
         self.log(" | ".join(parts))
 
     def _save_debug_frame(self, filename: str, image: np.ndarray) -> None:
@@ -889,37 +954,15 @@ class LiveEventProcessor:
                 rej,
                 f"{obj_class.upper()} REJECT {int(ow)}x{int(oh)}",
                 (max(5, cx - 100), max(22, cy)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                obj_color,
-                2,
-                cv2.LINE_AA,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, obj_color, 2, cv2.LINE_AA,
             )
         else:
             rv.draw_box_with_label(
-                rej,
-                obj_box,
-                f"{obj_class.upper()} REJECT {int(ow)}x{int(oh)}",
-                obj_color,
-                thickness=3,
+                rej, obj_box, f"{obj_class.upper()} REJECT {int(ow)}x{int(oh)}", obj_color, thickness=3,
             )
-        cv2.putText(
-            rej,
-            banner,
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.line(
-            rej,
-            tuple(self.line[0].astype(int)),
-            tuple(self.line[1].astype(int)),
-            (255, 255, 255),
-            2,
-        )
+        cv2.putText(rej, banner, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.line(rej, tuple(self.line[0].astype(int)), tuple(self.line[1].astype(int)), (255, 255, 255), 2)
+        cv2.line(rej, tuple(self.line_down[0].astype(int)), tuple(self.line_down[1].astype(int)), (0, 255, 255), 2)
         return rej
 
     def _draw_event_frame(
@@ -946,19 +989,13 @@ class LiveEventProcessor:
                 out,
                 f"{obj_class.upper()} {int(ow)}x{int(oh)} conf={track['confidence']:.2f}",
                 (max(5, cx - 120), max(22, cy)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                obj_color,
-                2,
-                cv2.LINE_AA,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, obj_color, 2, cv2.LINE_AA,
             )
         else:
             rv.draw_box_with_label(
-                out,
-                obj_box,
+                out, obj_box,
                 f"{obj_class.upper()} {int(ow)}x{int(oh)} conf={track['confidence']:.2f}",
-                obj_color,
-                thickness=3,
+                obj_color, thickness=3,
             )
         if person_info is not None:
             pm = person_info.get("mask")
@@ -969,43 +1006,28 @@ class LiveEventProcessor:
                     out,
                     f"PERSON {person_info['w']}x{person_info['h']} conf={person_info['confidence']:.2f}",
                     (max(5, pcx - 120), max(22, pcy)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA,
                 )
             else:
                 rv.draw_box_with_label(
-                    out,
-                    person_info["box"],
+                    out, person_info["box"],
                     f"PERSON {person_info['w']}x{person_info['h']} conf={person_info['confidence']:.2f}",
-                    (0, 255, 0),
-                    thickness=3,
+                    (0, 255, 0), thickness=3,
                 )
-        cv2.putText(
-            out,
-            f"{direction} | {assoc_str}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.line(
-            out,
-            tuple(self.line[0].astype(int)),
-            tuple(self.line[1].astype(int)),
-            (255, 255, 255),
-            2,
-        )
+        cv2.putText(out, f"{direction} | {assoc_str}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.line(out, tuple(self.line[0].astype(int)), tuple(self.line[1].astype(int)), (255, 255, 255), 2)
+        cv2.line(out, tuple(self.line_down[0].astype(int)), tuple(self.line_down[1].astype(int)), (0, 255, 255), 2)
         return out
+
+    # ------------------------------------------------------------------ #
+    #  Главный метод обработки кадра
+    # ------------------------------------------------------------------ #
 
     def process_frame(self, frame: np.ndarray, all_dets: list, frame_idx: int) -> np.ndarray:
         self._ensure_line(frame)
         debug_frame = frame.copy()
-        vis = _annotate_frame(debug_frame, all_dets, frame_idx)
+        vis = _annotate_frame(debug_frame, all_dets, frame_idx, self.line, self.line_down)
 
         primary_dets, person_dets = rv.split_detections(all_dets)
 
@@ -1043,28 +1065,34 @@ class LiveEventProcessor:
             for tr in self.tracks:
                 if tr["tracking_group"] != tracking_group:
                     continue
-
-                prev_box = tr["box"]
                 prev_c = tr["centers"][-1]
-
                 dist = float(np.linalg.norm(obj_c - prev_c))
                 if dist > rv.TRACK_DISTANCE:
                     continue
-
-                overlap = rv.iou_xyxy(obj_box, prev_box)
+                overlap = rv.iou_xyxy(obj_box, tr["box"])
                 score = overlap * 1000.0 - dist
                 if score > best_score:
                     best_score = score
                     best_track = tr
 
             if best_track is not None:
+                is_below_now = self._is_clearly_below(obj_box)
+                is_above_now = self._is_clearly_above(obj_box)
+                is_above_upper_now = self._is_clearly_above_upper(obj_box)
+
                 best_track["box"] = obj_box.copy()
                 best_track["confidence"] = det["confidence"]
                 best_track["class_name_current"] = obj_class
                 best_track["person_info_current"] = det["person_info"]
                 best_track["lost"] = 0
-                best_track["ever_below"] = best_track["ever_below"] or self._is_clearly_below(obj_box)
-                best_track["ever_above"] = best_track["ever_above"] or self._is_clearly_above(obj_box)
+                best_track["ever_below"] = best_track["ever_below"] or is_below_now
+                best_track["ever_above"] = best_track["ever_above"] or is_above_now
+                best_track["below_frames"] = best_track.get("below_frames", 0) + (1 if is_below_now else 0)
+                best_track["above_frames"] = best_track.get("above_frames", 0) + (1 if is_above_now else 0)
+                # счётчик кадров "явно выше верхней линии" — для DOWN
+                best_track["above_frames_upper"] = best_track.get("above_frames_upper", 0) + (
+                    1 if is_above_upper_now else 0
+                )
                 best_track["centers"].append(obj_c)
                 best_track["updated_this_frame"] = True
 
@@ -1084,8 +1112,14 @@ class LiveEventProcessor:
                 if len(best_track["history"]) > rv.TRACK_HISTORY:
                     best_track["history"].pop(0)
 
+                # Обновляем флаги DOWN-этапов
+                self._update_down_stage_flags(best_track, frame_idx)
+
                 updated_ids.add(best_track["id"])
             else:
+                is_below_now = self._is_clearly_below(obj_box)
+                is_above_now = self._is_clearly_above(obj_box)
+                is_above_upper_now = self._is_clearly_above_upper(obj_box)
                 hist_item = {
                     "frame_id": frame_idx,
                     "box": obj_box.copy(),
@@ -1095,28 +1129,37 @@ class LiveEventProcessor:
                 }
                 if "mask" in det:
                     hist_item["mask"] = det["mask"].copy()
-                self.tracks.append(
-                    {
-                        "id": self.next_track_id,
-                        "tracking_group": tracking_group,
-                        "class_name_current": obj_class,
-                        "box": obj_box.copy(),
-                        "confidence": det["confidence"],
-                        "rejected_small": False,
-                        "person_info_current": det["person_info"],
-                        "lost": 0,
-                        "counted_up": False,
-                        "counted_down": False,
-                        "rejected": False,
-                        "rejected_down": False,
-                        "rejected_small_down": False,
-                        "updated_this_frame": True,
-                        "ever_below": self._is_clearly_below(obj_box),
-                        "ever_above": self._is_clearly_above(obj_box),
-                        "centers": [obj_c],
-                        "history": [hist_item],
-                    }
-                )
+                new_track = {
+                    "id": self.next_track_id,
+                    "tracking_group": tracking_group,
+                    "class_name_current": obj_class,
+                    "box": obj_box.copy(),
+                    "confidence": det["confidence"],
+                    "rejected_small": False,
+                    "person_info_current": det["person_info"],
+                    "lost": 0,
+                    "counted_up": False,
+                    "counted_down": False,
+                    "rejected": False,
+                    "rejected_down": False,
+                    "rejected_small_down": False,
+                    "updated_this_frame": True,
+                    "ever_below": is_below_now,
+                    "ever_above": is_above_now,
+                    "below_frames": 1 if is_below_now else 0,
+                    "above_frames": 1 if is_above_now else 0,
+                    "above_frames_upper": 1 if is_above_upper_now else 0,
+                    "centers": [obj_c],
+                    "history": [hist_item],
+                    # DOWN-этапы
+                    "down_ever_above_upper": is_above_upper_now,
+                    "down_crossed_upper": False,
+                    "down_crossed_lower": False,
+                    "down_crossed_upper_frame": None,
+                    "down_crossed_lower_frame": None,
+                }
+                self._update_down_stage_flags(new_track, frame_idx)
+                self.tracks.append(new_track)
                 updated_ids.add(self.next_track_id)
                 self.next_track_id += 1
 
@@ -1129,11 +1172,14 @@ class LiveEventProcessor:
                 alive_tracks.append(tr)
         self.tracks = alive_tracks
 
+        # ---------------------------------------------------------------- #
+        #  UP events
+        # ---------------------------------------------------------------- #
         for tr in self.tracks:
             if tr["counted_up"]:
                 continue
             eval_data = self._evaluate_track(tr)
-            if tr["updated_this_frame"]:
+            if tr.get("updated_this_frame"):
                 self._log_track_decision(tr, frame_idx, eval_data)
 
             if len(tr["history"]) < LIVE_MIN_TRACK_HISTORY:
@@ -1145,7 +1191,6 @@ class LiveEventProcessor:
 
             obj_box = tr["box"]
             obj_class = self._get_event_class_recent(tr, EVENT_CLASS_WINDOW)
-
             ow, oh, oarea = rv.box_wh_area(obj_box)
 
             is_valid_size, invalid_reason = _is_valid_object_size(obj_class, obj_box)
@@ -1162,10 +1207,8 @@ class LiveEventProcessor:
             tr["counted_up"] = True
             self.events_count += 1
 
-            person_info = None
             assoc_str = obj_class
             recent_classes = [item.get("class_name") for item in tr["history"][-EVENT_CLASS_WINDOW:]]
-
             log_data = {
                 "video": self.source_name,
                 "frame": frame_idx,
@@ -1182,30 +1225,20 @@ class LiveEventProcessor:
 
             if rv.SAVE:
                 out = self._draw_event_frame(
-                    debug_frame,
-                    tr,
-                    obj_box,
-                    obj_class,
-                    ow,
-                    oh,
-                    person_info,
-                    assoc_str,
+                    debug_frame, tr, obj_box, obj_class, ow, oh, None, assoc_str,
                     tr["history"][-1].get("mask"),
                 )
                 filename = f"{self.source_stem}_UP_{assoc_str}_{frame_idx:06d}.jpg"
                 self._save_debug_frame(filename, out)
                 vis = out
 
+        # ---------------------------------------------------------------- #
+        #  DOWN events — двухлинейная логика
+        # ---------------------------------------------------------------- #
         for tr in self.tracks:
             if tr["counted_down"]:
                 continue
-            eval_down = self._evaluate_track_down(tr)
-
-            if len(tr["history"]) < LIVE_MIN_TRACK_HISTORY:
-                continue
-            if not eval_down["relaxed_started_above"]:
-                continue
-            if not eval_down["relaxed_crossed_down"]:
+            if not self._down_event_ready(tr):
                 continue
 
             obj_box = tr["box"]
@@ -1214,7 +1247,6 @@ class LiveEventProcessor:
                 continue
 
             ow, oh, oarea = rv.box_wh_area(obj_box)
-
             is_valid_size, invalid_reason = _is_valid_object_size(obj_class, obj_box)
             if not is_valid_size:
                 if not tr.get("rejected_small_down", False):
@@ -1229,10 +1261,8 @@ class LiveEventProcessor:
             tr["counted_down"] = True
             self.events_count_down += 1
 
-            person_info = None
             assoc_str = obj_class
             recent_classes = [item.get("class_name") for item in tr["history"][-EVENT_CLASS_WINDOW:]]
-
             log_data = {
                 "video": self.source_name,
                 "frame": frame_idx,
@@ -1244,19 +1274,14 @@ class LiveEventProcessor:
                 "object_w": int(ow),
                 "object_h": int(oh),
                 "object_area": int(oarea),
+                "down_upper_frame": tr.get("down_crossed_upper_frame"),
+                "down_lower_frame": tr.get("down_crossed_lower_frame"),
             }
             self.log("[EVENT ✔ DOWN] " + json.dumps(log_data, ensure_ascii=False))
 
             if rv.SAVE:
                 out = self._draw_event_frame(
-                    debug_frame,
-                    tr,
-                    obj_box,
-                    obj_class,
-                    ow,
-                    oh,
-                    person_info,
-                    assoc_str,
+                    debug_frame, tr, obj_box, obj_class, ow, oh, None, assoc_str,
                     tr["history"][-1].get("mask"),
                     direction="DOWN",
                 )
@@ -1399,9 +1424,7 @@ if HAS_PYQT:
                     frame_idx += 1
                     did_detect = DETECT_EVERY_N <= 1 or (frame_idx % DETECT_EVERY_N == 1)
                     if did_detect:
-                        last_dets = _load_frame_detections_seg(
-                            self.model, frame, self.class_names
-                        )
+                        last_dets = _load_frame_detections_seg(self.model, frame, self.class_names)
 
                     if frame_idx == 1:
                         st0 = _det_stats(last_dets)
@@ -1423,10 +1446,8 @@ if HAS_PYQT:
 
                     if self._save_mp4 and self.video_writer is None:
                         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        target_mp4 = (
-                            self._mp4_path
-                            if len(sources) == 1
-                            else event_processor.events_dir / f"{_source_stem(current_src)}.mp4"
+                        target_mp4 = _recording_mp4_path(
+                            current_src, sources, event_processor.events_dir, self._mp4_path
                         )
                         target_mp4.parent.mkdir(parents=True, exist_ok=True)
                         self.video_writer = cv2.VideoWriter(str(target_mp4), fourcc, out_fps, (w, h))
@@ -1621,8 +1642,9 @@ def run_headless_mp4(model, class_names, src) -> int:
                 h, w = vis.shape[:2]
                 if writer is None:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    target_mp4 = MP4_OUTPUT if len(
-                        sources) == 1 else event_processor.events_dir / f"{_source_stem(current_src)}.mp4"
+                    target_mp4 = _recording_mp4_path(
+                        current_src, sources, event_processor.events_dir, MP4_OUTPUT
+                    )
                     writer = cv2.VideoWriter(str(target_mp4), fourcc, out_fps, (w, h))
                     if not writer.isOpened():
                         print("Не удалось открыть VideoWriter", flush=True)

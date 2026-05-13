@@ -3,12 +3,16 @@
 RF-DETR Seg + PyQt окно + перемотка видео: подсчёт людей при пересечении линии DOWN.
 
 Что исправлено:
+  • событие DOWN только если проекция ноги/bbox попадает на отрезок LINE_NORM (не бесконечная прямая);
+  • DOWN только при явном пересечении сверху вниз + проверка движения ноги вниз по кадру;
+  • optional late_start/occlusion: RFDETR_LATE_START=1 / RFDETR_OCCLUSION_CROSS=1;
   • человек живёт TRACK_KEEP_ALIVE_SECONDS после пропажи детекта;
   • уже засчитанный потерянный трек НЕ забирает новых людей далеко от себя;
   • duplicate-фильтр больше не подавляет разных людей, идущих рядом;
   • при перемотке трекер и счётчик сбрасываются только для текущего просмотра;
   • cv2.imshow не используется — показ через PyQt QLabel;
-  • сохранение событий: JPG + events.jsonl.
+  • сохранение событий: JPG + events.jsonl;
+  • по завершении прогона — дописывается Excel sales_report_lineiny126.xlsx (кол-во входящих).
 
 Запуск с окном:
   python rfdetr_live_seg_new.py
@@ -60,7 +64,7 @@ SEG_CHECKPOINT_PATH = BASE_DIR / "new_dataset" / "checkpoint_best_total.pth"
 # Можно указать файл, папку с видео, RTSP/URL или индекс камеры.
 # Примеры:
 # LIVE_SOURCE = 0
-# LIVE_SOURCE = "rtsp://user:pass@192.168.1.10:554/stream1"
+# LIVE_SOURCE = "rtsp://viewer:ViewerPass_9347X@94.41.19.156:8554/cam50"
 # LIVE_SOURCE = str(BASE_DIR / "recordings_2" / "cam3" / "2026-05-06_09-22-55.mp4")
 LIVE_SOURCE: int | str | list[int | str] = str(BASE_DIR / "recordings_2" / "cam3")
 
@@ -76,12 +80,24 @@ LINE_NORM: list[tuple[float, float]] = [
 
 # DOWN = нижняя точка bbox перешла с верхней стороны линии на нижнюю.
 LINE_MARGIN_PX = 14.0
-SEGMENT_GATE_MARGIN_PX = 30.0
+SEGMENT_GATE_MARGIN_PX = 0.0
 
 # --- Трекинг / уникальность человека ---
-TRACK_KEEP_ALIVE_SECONDS = 15.0
+# После потери bbox трек живёт столько секунд (за стеной бывает ~10 с — нужен запас по FPS).
+TRACK_KEEP_ALIVE_SECONDS = 30.0
 TRACK_HISTORY = 80
 MIN_TRACK_HISTORY_FOR_EVENT = 2
+
+# Явное пересечение сверху вниз: минимум кадров, где нога классифицирована как "above".
+MIN_FRAMES_FOOT_SIDE_ABOVE_FOR_CROSS = 3
+
+# Средняя скорость ноги по кадру (увеличение Y = движение вниз по изображению).
+RECENT_FRAMES_FOR_FOOT_DY_CHECK = 6
+MIN_MEAN_FOOT_DY_DOWN_FOR_CROSS_PX = 0.2
+
+# «Shortcut»-режимы без классического пересечения (новые по умолчанию выключены: считаем по явному cross).
+ALLOW_LATE_START_CROSSING = os.environ.get("RFDETR_LATE_START", "0") == "1"
+ALLOW_OCCLUSION_CROSSING = os.environ.get("RFDETR_OCCLUSION_CROSS", "0") == "1"
 
 # Активный трек: обычная привязка.
 TRACK_MAX_CENTER_DISTANCE = 220.0
@@ -132,8 +148,18 @@ EVENT_REJECT_BORDER_MARGIN_PX = 6
 USE_PYQT_VIEWER = os.environ.get("RFDETR_HEADLESS", "0") != "1"
 SAVE_EVENTS = True
 SAVE_DEBUG_VIDEO = False
-OUTPUT_ROOT = BASE_DIR / "rfdetr_person_crossing_logs"
+OUTPUT_ROOT = BASE_DIR / "rfdetr_live_logs_3"
 OUTPUT_VIDEO_NAME = "annotated_output.mp4"
+
+# Excel-отчёт: заполняем только «кол-во входящих» за текущий месяц (счётчик DOWN).
+# Договоры и конверсию менеджер вносит вручную в том же файле.
+RETAIL_POINT_NAME = "Линейная126"
+SALES_REPORT_XLSX_PATH = BASE_DIR / "sales_report_lineiny126.xlsx"
+WRITE_SALES_REPORT_XLSX = os.environ.get("RFDETR_WRITE_SALES_XLSX", "1") != "0"
+SALES_REPORT_ACCUMULATE_INCOMING = os.environ.get("RFDETR_SALES_ACCUMULATE", "1") != "0"
+SALES_REPORT_HEADER_ROW = 1
+SALES_REPORT_DATA_ROW = 2
+SALES_REPORT_TOTAL_ROW = 3
 
 WINDOW_TITLE = "RF-DETR person crossing counter | Q / Esc — выход"
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm"}
@@ -244,6 +270,7 @@ def signed_distance_to_line(
         return 0.0
     return side_of_line(point, line_a, line_b) / line_len * float(bottom_side_sign)
 
+
 def projection_t_on_segment(point: np.ndarray, line_a: np.ndarray, line_b: np.ndarray) -> float:
     """
     t=0 — начало отрезка, t=1 — конец отрезка.
@@ -293,6 +320,7 @@ def box_near_segment_gate(
         np.array([x2, y2], dtype=np.float32),
     ]
     return any(point_near_segment_gate(p, line_a, line_b, margin_px) for p in points)
+
 
 def stable_side(distance: float, margin: float) -> str:
     if distance > margin:
@@ -387,6 +415,207 @@ def make_run_dir() -> Path:
     run_dir = OUTPUT_ROOT / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
+
+
+# =========================
+# EXCEL ОТЧЁТ (месяцы × 3 колонки)
+# =========================
+
+MONTH_NAMES_RU_NOMINATIVE = (
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
+)
+
+# Фон троек колонок по месяцам (как в шаблоне отчёта).
+MONTH_TRIPLET_FILL_HEX = (
+    "B4C6E7",
+    "C5D9F0",
+    "92D050",
+    "C6E0B4",
+    "548235",
+    "FFC000",
+    "9BC2E6",
+    "FFF2CC",
+    "F4B084",
+    "D9E1F2",
+    "E2F0D9",
+    "FCE4D6",
+)
+
+
+def _sales_incoming_col_1based(month: int) -> int:
+    """Колонка «кол-во входящих» для месяца 1..12 (первая колонка тройки)."""
+    m = max(1, min(12, int(month)))
+    return 3 + (m - 1) * 3
+
+
+def update_sales_report_xlsx(
+    incoming_count: int,
+    *,
+    retail_point: str = RETAIL_POINT_NAME,
+    path: Path = SALES_REPORT_XLSX_PATH,
+    when: datetime | None = None,
+) -> Path | None:
+    """
+    Создаёт или обновляет xlsx: в строке торговой точки пишет входящих за месяц `when`.
+    При SALES_REPORT_ACCUMULATE_INCOMING число прибавляется к уже внесённому в ячейке.
+    """
+    if not WRITE_SALES_REPORT_XLSX:
+        return None
+
+    try:
+        from openpyxl import Workbook, load_workbook
+        from openpyxl.styles import Alignment, Border, Font, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print(
+            "Для Excel-отчёта установите openpyxl: pip install openpyxl",
+            flush=True,
+        )
+        return None
+
+    when = when or datetime.now()
+    month = int(when.month)
+    inc_col = _sales_incoming_col_1based(month)
+    delta = int(incoming_count)
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    thin = Side(style="thin", color="FFCCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    title_font = Font(bold=True)
+    hdr_font = Font(bold=True, size=10)
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    workbook_fresh = False
+    if path.exists():
+        try:
+            wb = load_workbook(path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Не удалось открыть {path}: {exc}. Создаю новый файл.", flush=True)
+            wb = Workbook()
+            if "Sheet" in wb.sheetnames:
+                wb.remove(wb["Sheet"])
+            wb.create_sheet("Продажи", 0)
+            workbook_fresh = True
+    else:
+        wb = Workbook()
+        if "Sheet" in wb.sheetnames:
+            wb.remove(wb["Sheet"])
+        wb.create_sheet("Продажи", 0)
+        workbook_fresh = True
+
+    ws_sales = wb["Продажи"] if "Продажи" in wb.sheetnames else wb.active
+    _sales_report_fill_template(
+        ws_sales,
+        retail_point,
+        border,
+        title_font,
+        hdr_font,
+        hdr_align,
+        only_if_empty=not workbook_fresh,
+    )
+
+    cell = ws_sales.cell(SALES_REPORT_DATA_ROW, inc_col)
+    prev = cell.value
+    if isinstance(prev, (int, float)) and SALES_REPORT_ACCUMULATE_INCOMING:
+        cell.value = int(prev) + delta
+    elif prev is not None and str(prev).strip() != "" and SALES_REPORT_ACCUMULATE_INCOMING:
+        try:
+            cell.value = int(float(str(prev).replace(",", "."))) + delta
+        except ValueError:
+            cell.value = delta
+    else:
+        cell.value = delta
+
+    for c in range(3, 3 + 12 * 3):
+        col_letter = get_column_letter(c)
+        ws_sales.cell(SALES_REPORT_TOTAL_ROW, c).value = f"={col_letter}{SALES_REPORT_DATA_ROW}"
+
+    ws_sales.cell(SALES_REPORT_TOTAL_ROW, 1).value = "Всего"
+
+    try:
+        wb.save(path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Не удалось сохранить Excel-отчёт {path}: {exc}", flush=True)
+        return None
+
+    print(
+        f"Excel-отчёт: {path} | {retail_point} | "
+        f"{MONTH_NAMES_RU_NOMINATIVE[month - 1]} — входящих +{delta} → {cell.value}",
+        flush=True,
+    )
+    return path
+
+
+def _sales_report_fill_template(
+    ws,
+    retail_point: str,
+    border,
+    title_font,
+    hdr_font,
+    hdr_align,
+    *,
+    only_if_empty: bool = False,
+) -> None:
+    from openpyxl.styles import Alignment, PatternFill
+
+    a1 = ws.cell(SALES_REPORT_HEADER_ROW, 1)
+    if not only_if_empty or a1.value in (None, ""):
+        a1.value = "Торговая точка"
+        a1.font = title_font
+        a1.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        a1.border = border
+
+    tp = ws.cell(SALES_REPORT_DATA_ROW, 1)
+    if not only_if_empty or tp.value in (None, ""):
+        tp.value = retail_point
+        tp.border = border
+
+    tot = ws.cell(SALES_REPORT_TOTAL_ROW, 1)
+    if not only_if_empty or tot.value in (None, ""):
+        tot.value = "Всего"
+        tot.font = title_font
+        tot.border = border
+
+    for mi in range(12):
+        col0 = 3 + mi * 3
+        fill = PatternFill(
+            fill_type="solid",
+            start_color=MONTH_TRIPLET_FILL_HEX[mi],
+            end_color=MONTH_TRIPLET_FILL_HEX[mi],
+        )
+        mn = MONTH_NAMES_RU_NOMINATIVE[mi]
+        hdrs = (
+            f"Кол-во входящих\n({mn})",
+            f"Кол-во договоров\n({mn})",
+            f"Конверсия\n({mn})",
+        )
+        for j, text in enumerate(hdrs):
+            c = col0 + j
+            hc = ws.cell(SALES_REPORT_HEADER_ROW, c)
+            if not only_if_empty or hc.value in (None, ""):
+                hc.value = text
+                hc.font = hdr_font
+                hc.alignment = hdr_align
+            for r in range(SALES_REPORT_HEADER_ROW, SALES_REPORT_TOTAL_ROW + 1):
+                cell = ws.cell(r, c)
+                cell.fill = fill
+                cell.border = border
+
+    ws.column_dimensions["A"].width = 22
+
 
 # =========================
 # DETECTION
@@ -662,20 +891,29 @@ class CrossingCounter:
 
         prev = tr.history[-2]
         curr = tr.history[-1]
-        # ВАЖНО: работаем только с коротким отрезком LINE_NORM.
-        # Без этого считается бесконечная прямая, поэтому люди слева/справа от линии тоже засчитываются.
+
+        # Только короткий отрезок LINE_NORM (иначе засчитываются люди слева/справа от линии).
         if not box_near_segment_gate(curr.box, line_a, line_b):
             return False, "outside_line_segment"
-        if touches_frame_border(curr.box, frame_w, frame_h):
-            return False, "touches_frame_border"
-        # Отсекаем краевые артефакты, особенно справа/снизу.
         if touches_frame_border(curr.box, frame_w, frame_h):
             return False, "touches_frame_border"
 
         foot_cross = prev.foot_d <= -LINE_MARGIN_PX and curr.foot_d >= LINE_MARGIN_PX
         from_above_to_below = prev.foot_side in {"above", "on"} and curr.foot_side == "below"
 
+        frames_above = sum(1 for h in tr.history if h.foot_side == "above")
+        had_deep_above = any(h.foot_d <= -LINE_MARGIN_PX for h in list(tr.history)[:-1])
+
+        mean_dy = self._recent_mean_foot_dy(tr, RECENT_FRAMES_FOR_FOOT_DY_CHECK)
+
+        # Только явное пересечение сверху вниз + движение ноги вниз по кадру (отсекает «уходит вверх»).
         if tr.ever_above and (foot_cross or from_above_to_below):
+            if frames_above < MIN_FRAMES_FOOT_SIDE_ABOVE_FOR_CROSS:
+                return False, "insufficient_above_history"
+            if not had_deep_above:
+                return False, "no_prior_deep_above"
+            if mean_dy is not None and mean_dy < MIN_MEAN_FOOT_DY_DOWN_FOR_CROSS_PX:
+                return False, "foot_moving_up_in_frame"
             if self._recent_travel(tr) >= MIN_RECENT_TRAVEL_PX:
                 return True, "foot_crossed_from_above"
             return False, "too_static"
@@ -683,9 +921,10 @@ class CrossingCounter:
         bottom_delta = curr.foot_d - prev.foot_d
         center_delta = curr.center_d - prev.center_d
 
-        # Обычный late_start: человек впервые появился уже рядом с линией и сразу пошёл вниз.
+        # По умолчанию выключено (см. ALLOW_*): без классического cross не считаем «архивным» событием.
         late_start_allowed = (
-                not tr.ever_above
+                ALLOW_LATE_START_CROSSING
+                and not tr.ever_above
                 and len(tr.history) <= 4
                 and curr.conf >= LATE_START_MIN_CONF
                 and curr.foot_side == "below"
@@ -693,14 +932,14 @@ class CrossingCounter:
                 and center_delta >= LATE_START_MIN_CENTER_DELTA
         )
         if late_start_allowed:
+            if mean_dy is not None and mean_dy < MIN_MEAN_FOOT_DY_DOWN_FOR_CROSS_PX:
+                return False, "late_start_not_moving_down_in_frame"
             return True, "late_start_moving_down"
 
-        # ВАЖНО: случай перекрытия.
-        # Человек мог быть закрыт другим человеком/объектом, потом появился уже ниже линии.
-        # Если первые видимые точки были около линии, а потом bbox явно ушёл вниз — считаем.
         hist = list(tr.history)
         if (
-                not tr.ever_above
+                ALLOW_OCCLUSION_CROSSING
+                and not tr.ever_above
                 and 3 <= len(hist) <= OCCLUSION_MAX_HISTORY
                 and curr.conf >= OCCLUSION_MIN_CONF
                 and curr.foot_side == "below"
@@ -712,9 +951,19 @@ class CrossingCounter:
             center_moved_down_enough = (curr.center_d - first.center_d) >= OCCLUSION_MIN_CENTER_DELTA
 
             if started_near_line and moved_down_enough and center_moved_down_enough:
+                if mean_dy is not None and mean_dy < MIN_MEAN_FOOT_DY_DOWN_FOR_CROSS_PX:
+                    return False, "occlusion_not_moving_down_in_frame"
                 return True, "occlusion_reappear_moved_down"
 
         return False, "no_down_cross"
+
+    @staticmethod
+    def _recent_mean_foot_dy(tr: Track, n: int) -> float | None:
+        hist = list(tr.history)[-max(2, int(n)) :]
+        if len(hist) < 2:
+            return None
+        dys = [float(hist[i].foot[1] - hist[i - 1].foot[1]) for i in range(1, len(hist))]
+        return sum(dys) / len(dys)
 
     def _recent_travel(self, tr: Track, n: int = 8) -> float:
         hist = list(tr.history)[-n:]
@@ -800,7 +1049,10 @@ class CrossingCounter:
         )
 
         if SAVE_EVENTS:
-            filename = f"{self.src_stem}_DOWN_{self.count_down:04d}_frame_{curr.frame_idx:06d}.jpg"
+            ts = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+            filename = (
+                f"{self.src_stem}_{ts}_DOWN_{self.count_down:04d}_frame_{curr.frame_idx:06d}.jpg"
+            )
             path = self.events_dir / filename
             cv2.imwrite(str(path), out)
             print(f"  saved: {path}", flush=True)
@@ -1376,6 +1628,7 @@ class MainWindow(QMainWindow):
 
     def on_finished_ok(self, total_down: int, run_dir: str) -> None:
         print(f"\nИТОГО DOWN={total_down} | логи: {run_dir}", flush=True)
+        update_sales_report_xlsx(total_down)
         self.btn_pause.setEnabled(False)
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001
@@ -1535,6 +1788,7 @@ def main() -> int:
         total += process_source_headless(model, class_names, src, run_dir)
 
     print(f"\nИТОГО DOWN={total} | логи: {run_dir}", flush=True)
+    update_sales_report_xlsx(total)
     return 0
 
 

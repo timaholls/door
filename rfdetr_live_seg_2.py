@@ -476,9 +476,8 @@ def _annotate_frame(
 
 def _new_run_dir() -> Path:
     LIVE_RUN_ROOT.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = LIVE_RUN_ROOT / f"run_{stamp}"
-    run_dir.mkdir(parents=False)
+    run_dir = LIVE_RUN_ROOT / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
 
 
@@ -516,6 +515,18 @@ def _source_stem(src) -> str:
     if p.suffix:
         return p.stem
     return p.name or "live"
+
+
+def _recording_mp4_path(
+        current_src: int | str,
+        sources: list,
+        events_dir: Path,
+        single_video_file_out: Path,
+) -> Path:
+    """Прямой эфир / поток: mp4 в папке прогона; один локальный видеофайл — путь как раньше."""
+    if len(sources) == 1 and _is_video_file(current_src):
+        return single_video_file_out
+    return events_dir / f"{_source_stem(current_src)}.mp4"
 
 
 def _tracking_group_name(class_name: str) -> str:
@@ -1992,10 +2003,8 @@ if HAS_PYQT:
 
                     if self._save_mp4 and self.video_writer is None:
                         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        target_mp4 = (
-                            self._mp4_path
-                            if len(sources) == 1
-                            else event_processor.events_dir / f"{_source_stem(current_src)}.mp4"
+                        target_mp4 = _recording_mp4_path(
+                            current_src, sources, event_processor.events_dir, self._mp4_path
                         )
                         target_mp4.parent.mkdir(parents=True, exist_ok=True)
                         self.video_writer = cv2.VideoWriter(str(target_mp4), fourcc, out_fps, (w, h))
@@ -2281,8 +2290,9 @@ def run_headless_mp4(model, class_names, src) -> int:
                 h, w = vis.shape[:2]
                 if writer is None:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    target_mp4 = MP4_OUTPUT if len(
-                        sources) == 1 else event_processor.events_dir / f"{_source_stem(current_src)}.mp4"
+                    target_mp4 = _recording_mp4_path(
+                        current_src, sources, event_processor.events_dir, MP4_OUTPUT
+                    )
                     writer = cv2.VideoWriter(str(target_mp4), fourcc, out_fps, (w, h))
                     if not writer.isOpened():
                         print("Не удалось открыть VideoWriter", flush=True)
