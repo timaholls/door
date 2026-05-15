@@ -97,9 +97,9 @@ TRIPWIRE_MASK_MIN_OVERLAP_PX = 12
 DOOR_LINE_EVENT_DEDUP_ENABLED = True
 # Сколько кадров «замораживаем» зону после последнего события.
 # При FPS~25 и двери 2-3 сек в кадре: 25*5=125. Ставим с запасом.
-DOOR_LINE_EVENT_DEDUP_FRAMES = 45
+DOOR_LINE_EVENT_DEDUP_FRAMES = 80
 # Если центр нового bbox дальше этого расстояния — это другая дверь, не дубль.
-DOOR_LINE_EVENT_DEDUP_CENTER_DIST_PX = 350.0
+DOOR_LINE_EVENT_DEDUP_CENTER_DIST_PX = 500.0
 # Минимальный IoU нового bbox с bbox последнего события (другой track_id).
 # Низкий порог: дверь могла немного сместиться.
 DOOR_LINE_EVENT_DEDUP_MIN_IOU_DIFFERENT_TRACK = 0.10
@@ -117,7 +117,7 @@ LIVE_RELAXED_MAX_PERSON_CENTER_DIST_FACTOR = 1.55
 
 EVENT_CLASS_WINDOW = 7
 EVENT_PRIMARY_CLASSES = (rv.DOOR_CLASS_NAME,)
-EVENT_MIN_TRACK_HISTORY = 3
+EVENT_MIN_TRACK_HISTORY = 4
 EVENT_MIN_MEAN_CONFIDENCE = 0.35
 EVENT_MIN_MASK_OVERLAP_PX = 40
 EVENT_MIN_MASK_OVERLAP_PER_BBOX_W = 0.15
@@ -130,12 +130,12 @@ EVENT_STATIC_SIZE_DELTA_PX = 12.0
 EVENT_STATIC_CENTER_TRAVEL_REL = 0.04
 EVENT_STATIC_SIZE_DELTA_REL = 0.05
 
-MIN_DOOR_WIDTH_PX = 280      # было 200
-MIN_DOOR_HEIGHT_PX = 450     # было 320
-MIN_DOOR_AREA_PX2 = 130000   # было 70000
+MIN_DOOR_WIDTH_PX = 200
+MIN_DOOR_HEIGHT_PX = 280
+MIN_DOOR_AREA_PX2 = 80000
 MAX_DOOR_AREA_PX2 = 0
 MAX_DOOR_ASPECT_HW = 3.0
-MAX_DOOR_ASPECT_WH = 1.3     # было 3.0 — ширина не может быть больше высоты в 1.2 раза
+MAX_DOOR_ASPECT_WH = 1.6     # было 3.0 — ширина не может быть больше высоты в 1.2 раза
 
 MIN_TRIM_WIDTH_PX = 20
 MIN_TRIM_HEIGHT_PX = 80
