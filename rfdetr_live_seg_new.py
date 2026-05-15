@@ -88,7 +88,9 @@ TRACK_KEEP_ALIVE_SECONDS = 30.0
 TRACK_HISTORY = 80
 MIN_TRACK_HISTORY_FOR_EVENT = 2
 
-# Явное пересечение сверху вниз: минимум кадров, где нога классифицирована как "above".
+# Минимум кадров «подхода с дальней стороны»: строго above, либо в полосе on при foot_d < 0
+# (ещё по знаку по ту же сторону, что и above). Иначе быстрое пересечение даёт только 2× above
+# и несколько on — и срабатывает insufficient_above_history на кадре перехода.
 MIN_FRAMES_FOOT_SIDE_ABOVE_FOR_CROSS = 3
 
 # Средняя скорость ноги по кадру (увеличение Y = движение вниз по изображению).
@@ -98,6 +100,8 @@ MIN_MEAN_FOOT_DY_DOWN_FOR_CROSS_PX = 0.2
 # «Shortcut»-режимы без классического пересечения (новые по умолчанию выключены: считаем по явному cross).
 ALLOW_LATE_START_CROSSING = os.environ.get("RFDETR_LATE_START", "0") == "1"
 ALLOW_OCCLUSION_CROSSING = os.environ.get("RFDETR_OCCLUSION_CROSS", "0") == "1"
+# Печать в консоль при каждом отказе should_count_down (отключить: RFDETR_PRINT_REJECT=0).
+PRINT_DOWN_REJECT = os.environ.get("RFDETR_PRINT_REJECT", "1") == "0"
 
 # Активный трек: обычная привязка.
 TRACK_MAX_CENTER_DISTANCE = 220.0
@@ -674,6 +678,13 @@ class HistoryItem:
     mask: np.ndarray | None = None
 
 
+def foot_history_far_side(h: HistoryItem) -> bool:
+    """Дальняя полуплоскость: strict above или полоса on с отрицательным foot_d (ещё «до» линии по знаку)."""
+    if h.foot_side == "above":
+        return True
+    return h.foot_side == "on" and h.foot_d < 0.0
+
+
 @dataclass
 class Track:
     track_id: int
@@ -851,6 +862,20 @@ class EventRecord:
     center: np.ndarray
 
 
+def print_down_reject(tr: Track, reason: str) -> None:
+    if not PRINT_DOWN_REJECT:
+        return
+    if not tr.history:
+        print(f"[reject DOWN] frame=? id={tr.track_id} reason={reason}", flush=True)
+        return
+    h = tr.history[-1]
+    print(
+        f"[reject DOWN] frame={h.frame_idx} id={tr.track_id} reason={reason} "
+        f"foot_side={h.foot_side} foot_d={h.foot_d:.1f} ever_above={tr.ever_above}",
+        flush=True,
+    )
+
+
 class CrossingCounter:
     def __init__(self, run_dir: Path, src: int | str, duplicate_suppress_frames: int) -> None:
         self.run_dir = run_dir
@@ -901,7 +926,7 @@ class CrossingCounter:
         foot_cross = prev.foot_d <= -LINE_MARGIN_PX and curr.foot_d >= LINE_MARGIN_PX
         from_above_to_below = prev.foot_side in {"above", "on"} and curr.foot_side == "below"
 
-        frames_above = sum(1 for h in tr.history if h.foot_side == "above")
+        frames_above = sum(1 for h in tr.history if foot_history_far_side(h))
         had_deep_above = any(h.foot_d <= -LINE_MARGIN_PX for h in list(tr.history)[:-1])
 
         mean_dy = self._recent_mean_foot_dy(tr, RECENT_FRAMES_FOR_FOOT_DY_CHECK)
@@ -1342,6 +1367,8 @@ class ProcessingWorker(QThread):
                     should_count, reason = counter.should_count_down(tr, fw, fh, line_a, line_b)
                     if should_count:
                         vis = counter.register_down(vis, tr, reason)
+                    else:
+                        print_down_reject(tr, reason)
 
                 last_vis = vis
                 self.frame_ready.emit(vis)
@@ -1714,6 +1741,8 @@ def process_source_headless(
                 should_count, reason = counter.should_count_down(tr, fw, fh, line_a, line_b)
                 if should_count:
                     vis = counter.register_down(vis, tr, reason)
+                else:
+                    print_down_reject(tr, reason)
 
             if frame_idx % 25 == 0:
                 active_tracks = [t for t in tracker.tracks if t.lost == 0]
