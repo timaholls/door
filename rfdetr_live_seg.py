@@ -7,6 +7,8 @@
 
 Зависимость: pip install PyQt5 supervision
 
+В окне для файлов: ползунок / номер кадра / шаг ±1…±100 / пауза (как в rfdetr_live_seg_new.py).
+
 Без окна: RFDETR_LIVE_HEADLESS=1 python rfdetr_live_seg.py
 
 Чекпоинт: SEG_CHECKPOINT_PATH (веса сегментации, не bbox-only).
@@ -22,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -56,14 +59,18 @@ STATIC_TRIPWIRE_DOWN_LINE_NORM: list[tuple[float, float]] = [
 
 
 try:
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal
+    from PyQt5.QtCore import QEvent, Qt, QThread, pyqtSignal
     from PyQt5.QtGui import QImage, QKeySequence, QPixmap
     from PyQt5.QtWidgets import (
         QApplication,
         QHBoxLayout,
         QLabel,
         QMainWindow,
+        QPushButton,
         QShortcut,
+        QSlider,
+        QSpinBox,
+        QVBoxLayout,
         QWidget,
     )
 
@@ -513,6 +520,15 @@ class LiveEventProcessor:
         self.top_side_sign_value_down = None
         self.bottom_side_sign_value_down = None
 
+        self.tracks = []
+        self.next_track_id = 0
+        self.events_count = 0
+        self.events_count_down = 0
+        self.rejected_count = 0
+        self.rejected_count_down = 0
+
+    def reset_for_seek(self) -> None:
+        """Сброс треков и счётчиков при перемотке видео (как новый отрезок просмотра)."""
         self.tracks = []
         self.next_track_id = 0
         self.events_count = 0
@@ -1304,6 +1320,8 @@ if HAS_PYQT:
         frame_ready = pyqtSignal(object)
         log = pyqtSignal(str)
         finished_ok = pyqtSignal()
+        video_opened = pyqtSignal(int, str)
+        frame_progress = pyqtSignal(int)
 
         def __init__(
                 self,
@@ -1327,9 +1345,43 @@ if HAS_PYQT:
             self._wait_ms = 1
             self.video_writer: cv2.VideoWriter | None = None
             self._jsonl_fp: object | None = None
+            self._pause = False
+            self._seek_lock = threading.Lock()
+            self._seek_frame_1based: int | None = None
 
         def request_stop(self) -> None:
             self._stop = True
+
+        def request_pause_toggle(self) -> None:
+            self._pause = not self._pause
+
+        def request_seek_frame(self, frame_1based: int) -> None:
+            with self._seek_lock:
+                self._seek_frame_1based = max(1, int(frame_1based))
+
+        def _consume_seek(self) -> int | None:
+            with self._seek_lock:
+                val = self._seek_frame_1based
+                self._seek_frame_1based = None
+                return val
+
+        def _seek_to_frame(
+                self,
+                cap: cv2.VideoCapture,
+                target_frame_1based: int,
+                total_frames: int,
+                event_processor: LiveEventProcessor,
+        ) -> int:
+            target = max(1, int(target_frame_1based))
+            if total_frames > 0:
+                target = min(target, total_frames)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target - 1)
+            event_processor.reset_for_seek()
+            self.frame_progress.emit(target)
+            self.log.emit(
+                f"Перемотка → кадр {target}" + (f" / {total_frames}" if total_frames > 0 else "")
+            )
+            return target
 
         def run(self) -> None:
             _write_run_info(
@@ -1407,13 +1459,48 @@ if HAS_PYQT:
                     },
                 )
 
+                source_first_frame_logged = False
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                seek_enabled = _is_video_file(current_src) and total_frames > 1
+                self.video_opened.emit(total_frames if seek_enabled else 0, _source_label(current_src))
+                if seek_enabled:
+                    self.log.emit(f"Перемотка доступна: кадры 1…{total_frames}")
+                else:
+                    self.log.emit("Перемотка недоступна (камера/RTSP или неизвестная длина файла).")
+
                 last_dets: list = []
                 frame_idx = 0
+                last_vis: np.ndarray | None = None
 
                 while not self._stop:
+                    if self._pause:
+                        pending_seek = self._consume_seek()
+                        if seek_enabled and pending_seek is not None:
+                            frame_idx = self._seek_to_frame(
+                                cap, pending_seek, total_frames, event_processor
+                            )
+                            last_dets = []
+                            last_vis = None
+                        else:
+                            self.msleep(25)
+                            continue
+                    else:
+                        pending_seek = self._consume_seek()
+                        if seek_enabled and pending_seek is not None:
+                            frame_idx = self._seek_to_frame(
+                                cap, pending_seek, total_frames, event_processor
+                            )
+                            last_dets = []
+                            last_vis = None
+
                     ok, frame = cap.read()
                     if not ok or frame is None:
-                        if LOOP_VIDEO_FILE and len(sources) == 1 and _is_video_file(current_src):
+                        if (
+                                not seek_enabled
+                                and LOOP_VIDEO_FILE
+                                and len(sources) == 1
+                                and _is_video_file(current_src)
+                        ):
                             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                             frame_idx = 0
                             self.log.emit("Повтор с начала файла.")
@@ -1421,12 +1508,22 @@ if HAS_PYQT:
                         self.log.emit(f"Конец источника: {_source_label(current_src)}")
                         break
 
-                    frame_idx += 1
-                    did_detect = DETECT_EVERY_N <= 1 or (frame_idx % DETECT_EVERY_N == 1)
+                    if seek_enabled:
+                        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                        frame_idx = max(1, pos)
+                    else:
+                        frame_idx += 1
+
+                    did_detect = (
+                            DETECT_EVERY_N <= 1
+                            or (frame_idx % DETECT_EVERY_N == 1)
+                            or not last_dets
+                    )
                     if did_detect:
                         last_dets = _load_frame_detections_seg(self.model, frame, self.class_names)
 
-                    if frame_idx == 1:
+                    if not source_first_frame_logged and frame_idx == 1:
+                        source_first_frame_logged = True
                         st0 = _det_stats(last_dets)
                         _tail = (
                             f"дальше сводка каждые {LOG_EVERY_N_FRAMES} кадр."
@@ -1442,6 +1539,20 @@ if HAS_PYQT:
                         vis = event_processor.process_frame(frame, last_dets, frame_idx)
                     else:
                         vis = event_processor.annotate_frame(frame, last_dets, frame_idx)
+
+                    if self._pause:
+                        h_ov, w_ov = vis.shape[:2]
+                        cv2.putText(
+                            vis,
+                            "PAUSED",
+                            (w_ov - 130, 34),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.85,
+                            (0, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+
                     h, w = vis.shape[:2]
 
                     if self._save_mp4 and self.video_writer is None:
@@ -1476,9 +1587,20 @@ if HAS_PYQT:
                         if cv2.imwrite(str(jpeg_path), vis):
                             self.log.emit(f"  сохранён кадр: {jpeg_path}")
 
+                    last_vis = vis
                     self.frame_ready.emit(vis)
+
+                    if seek_enabled:
+                        self.frame_progress.emit(frame_idx)
+
+                    if self._pause:
+                        continue
+
                     if wait_ms > 0:
                         self.msleep(wait_ms)
+
+                if last_vis is not None and self._pause:
+                    self.frame_ready.emit(last_vis)
 
                 cap.release()
                 total_events += event_processor.events_count
@@ -1510,21 +1632,193 @@ if HAS_PYQT:
             self.setWindowTitle(WINDOW_TITLE)
             self._worker = worker
             self._full_pix: QPixmap | None = None
+            self._video_total = 0
+            self._pause_seek_sync = False
+            self._current_frame = 1
+            self._paused = False
 
             central = QWidget()
-            layout = QHBoxLayout(central)
+            main_layout = QVBoxLayout(central)
+
             self._label = QLabel()
             self._label.setAlignment(Qt.AlignCenter)
             self._label.setMinimumSize(960, 540)
             self._label.setStyleSheet("background-color: #1a1a1a;")
-            layout.addWidget(self._label)
+            main_layout.addWidget(self._label, 1)
+
+            seek_row = QHBoxLayout()
+            self.lbl_seek = QLabel("Перемотка: ожидание источника…")
+            self.slider = QSlider(Qt.Horizontal)
+            self.slider.setRange(1, 1)
+            self.slider.setEnabled(False)
+
+            self.spin = QSpinBox()
+            self.spin.setRange(1, 1)
+            self.spin.setEnabled(False)
+
+            self.btn_minus_100 = QPushButton("-100")
+            self.btn_minus_10 = QPushButton("-10")
+            self.btn_minus_1 = QPushButton("-1")
+            self.btn_plus_1 = QPushButton("+1")
+            self.btn_plus_10 = QPushButton("+10")
+            self.btn_plus_100 = QPushButton("+100")
+            self.btn_mid = QPushButton("Середина")
+            self.btn_pause = QPushButton("Пауза")
+
+            for btn in [
+                self.btn_minus_100,
+                self.btn_minus_10,
+                self.btn_minus_1,
+                self.btn_plus_1,
+                self.btn_plus_10,
+                self.btn_plus_100,
+                self.btn_mid,
+            ]:
+                btn.setEnabled(False)
+
+            seek_row.addWidget(self.lbl_seek)
+            seek_row.addWidget(self.slider, 1)
+            seek_row.addWidget(self.spin)
+            seek_row.addWidget(self.btn_minus_100)
+            seek_row.addWidget(self.btn_minus_10)
+            seek_row.addWidget(self.btn_minus_1)
+            seek_row.addWidget(self.btn_plus_1)
+            seek_row.addWidget(self.btn_plus_10)
+            seek_row.addWidget(self.btn_plus_100)
+            seek_row.addWidget(self.btn_mid)
+            seek_row.addWidget(self.btn_pause)
+            main_layout.addLayout(seek_row)
+
             self.setCentralWidget(central)
 
             worker.frame_ready.connect(self._on_frame)
             worker.log.connect(self._on_log)
+            worker.video_opened.connect(self.on_video_opened)
+            worker.frame_progress.connect(self.on_frame_progress)
+
+            self.slider.sliderPressed.connect(self.on_slider_pressed)
+            self.slider.sliderReleased.connect(self.on_slider_released)
+            self.spin.editingFinished.connect(self.on_spin_seek)
+            self.spin.lineEdit().installEventFilter(self)
+
+            self.btn_mid.clicked.connect(self.on_seek_middle)
+            self.btn_pause.clicked.connect(self.on_pause_toggle)
+            self.btn_minus_100.clicked.connect(lambda: self.on_step(-100))
+            self.btn_minus_10.clicked.connect(lambda: self.on_step(-10))
+            self.btn_minus_1.clicked.connect(lambda: self.on_step(-1))
+            self.btn_plus_1.clicked.connect(lambda: self.on_step(1))
+            self.btn_plus_10.clicked.connect(lambda: self.on_step(10))
+            self.btn_plus_100.clicked.connect(lambda: self.on_step(100))
 
             QShortcut(QKeySequence("Q"), self, activated=self.close)
             QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.close)
+            QShortcut(QKeySequence(Qt.Key_Space), self, activated=self.on_pause_toggle)
+            QShortcut(QKeySequence(Qt.Key_Left), self, activated=lambda: self.on_step(-1))
+            QShortcut(QKeySequence(Qt.Key_Right), self, activated=lambda: self.on_step(1))
+            QShortcut(QKeySequence("Ctrl+Left"), self, activated=lambda: self.on_step(-10))
+            QShortcut(QKeySequence("Ctrl+Right"), self, activated=lambda: self.on_step(10))
+            QShortcut(QKeySequence("M"), self, activated=self.on_seek_middle)
+
+        def on_video_opened(self, total_frames: int, name: str) -> None:
+            self._video_total = int(total_frames)
+            self._current_frame = 1
+
+            if self._video_total <= 1:
+                self.lbl_seek.setText(f"{name}: перемотка недоступна")
+                self.slider.setEnabled(False)
+                self.spin.setEnabled(False)
+                for btn in [
+                    self.btn_minus_100,
+                    self.btn_minus_10,
+                    self.btn_minus_1,
+                    self.btn_plus_1,
+                    self.btn_plus_10,
+                    self.btn_plus_100,
+                    self.btn_mid,
+                ]:
+                    btn.setEnabled(False)
+                return
+
+            self.lbl_seek.setText(f"{name}: кадр 1…{self._video_total}")
+            self.slider.setRange(1, self._video_total)
+            self.spin.setRange(1, self._video_total)
+            self.slider.setValue(1)
+            self.spin.setValue(1)
+            self.slider.setEnabled(True)
+            self.spin.setEnabled(True)
+            for btn in [
+                self.btn_minus_100,
+                self.btn_minus_10,
+                self.btn_minus_1,
+                self.btn_plus_1,
+                self.btn_plus_10,
+                self.btn_plus_100,
+                self.btn_mid,
+            ]:
+                btn.setEnabled(True)
+
+        def on_frame_progress(self, frame_idx: int) -> None:
+            self._current_frame = max(1, int(frame_idx))
+            if self._video_total <= 1 or self._pause_seek_sync:
+                return
+
+            v = max(1, min(self._current_frame, self._video_total))
+            self.slider.blockSignals(True)
+            self.spin.blockSignals(True)
+            self.slider.setValue(v)
+            self.spin.setValue(v)
+            self.slider.blockSignals(False)
+            self.spin.blockSignals(False)
+
+        def on_slider_pressed(self) -> None:
+            self._pause_seek_sync = True
+
+        def on_slider_released(self) -> None:
+            if not self.slider.isEnabled():
+                self._pause_seek_sync = False
+                return
+            v = self.slider.value()
+            self.spin.setValue(v)
+            self._worker.request_seek_frame(v)
+            self._pause_seek_sync = False
+
+        def on_spin_seek(self) -> None:
+            if not self.spin.isEnabled() or self._video_total <= 1:
+                return
+            v = max(1, min(int(self.spin.value()), self._video_total))
+            self.spin.setValue(v)
+            self.slider.setValue(v)
+            self._worker.request_seek_frame(v)
+            self.spin.clearFocus()
+
+        def on_seek_middle(self) -> None:
+            if self._video_total <= 1:
+                return
+            mid = max(1, self._video_total // 2)
+            self.slider.setValue(mid)
+            self.spin.setValue(mid)
+            self._worker.request_seek_frame(mid)
+
+        def on_step(self, delta: int) -> None:
+            if self._video_total <= 1:
+                return
+            target = max(1, min(self._video_total, self._current_frame + int(delta)))
+            self.slider.setValue(target)
+            self.spin.setValue(target)
+            self._worker.request_seek_frame(target)
+
+        def on_pause_toggle(self) -> None:
+            self._paused = not self._paused
+            self.btn_pause.setText("Продолжить" if self._paused else "Пауза")
+            self._worker.request_pause_toggle()
+
+        def eventFilter(self, obj, event) -> bool:  # noqa: ANN001
+            if obj == self.spin.lineEdit():
+                if event.type() == QEvent.FocusIn:
+                    self._pause_seek_sync = True
+                elif event.type() == QEvent.FocusOut:
+                    self._pause_seek_sync = False
+            return super().eventFilter(obj, event)
 
         def _apply_scale(self) -> None:
             if self._full_pix is None or self._full_pix.isNull():

@@ -110,10 +110,12 @@ LINE_EVENT_USE_PERSON_ASSOCIATION = False
 TRIPWIRE_MASK_LINE_THICKNESS_PX = 4
 TRIPWIRE_MASK_MIN_OVERLAP_PX = 12
 
-DOOR_LINE_EVENT_DEDUP_FRAMES = 30   # было 180→60→30: разные двери приходят с шагом ~40f
-DOOR_LINE_EVENT_DEDUP_CENTER_DIST_PX = 200.0  # было 400 → центры >200px ⇒ это разные двери, не дубль
-DOOR_LINE_EVENT_DEDUP_MIN_IOU_DIFFERENT_TRACK = 0.75  # было 0.12 → разные track_id ⇒ дедуп только при почти идентичном bbox
-DOOR_LINE_EVENT_DEDUP_ENABLED = False  # выкл: дедуп уже делают per-track (FIRST_HIT_PER_TRACK + SUPPRESS_FRAGMENT_OF_LATCHED_TRACK)
+DOOR_LINE_EVENT_DEDUP_FRAMES = 55   # потеря трека + повторное касание линии той же дверью
+DOOR_LINE_EVENT_DEDUP_CENTER_DIST_PX = 200.0  # центры дальше — считаем другой объект
+DOOR_LINE_EVENT_DEDUP_MIN_IOU_DIFFERENT_TRACK = 0.40  # ниже порог: маска bbox сильно меняется на линии
+# Если track_id другой (фрагментация трека), но центр почти тот же — это та же дверь (IoU мог просесть).
+DOOR_LINE_EVENT_DEDUP_STRICT_CENTER_PX = 150.0
+DOOR_LINE_EVENT_DEDUP_ENABLED = True
 
 LIVE_DEBUG_DOOR_LINE_PER_FRAME_FORCE = False
 LIVE_DEBUG_DOOR_LINE_PER_FRAME = False
@@ -654,10 +656,14 @@ class LiveEventProcessor:
             self._last_primary_line_event_track_id
         ):
             return True
-        if self._last_primary_line_event_box is None:
-            return False
-        iou = float(rv.iou_xyxy(self._last_primary_line_event_box, obj_box))
-        return iou >= DOOR_LINE_EVENT_DEDUP_MIN_IOU_DIFFERENT_TRACK
+        # Другой track_id — та же физическая дверь после краткой потери детекции / дробления трека.
+        if self._last_primary_line_event_box is not None:
+            iou = float(rv.iou_xyxy(self._last_primary_line_event_box, obj_box))
+            if iou >= DOOR_LINE_EVENT_DEDUP_MIN_IOU_DIFFERENT_TRACK:
+                return True
+        if d < DOOR_LINE_EVENT_DEDUP_STRICT_CENTER_PX:
+            return True
+        return False
 
     def _find_overlapping_latched_track(self, tr: dict, frame_idx: int) -> dict | None:
         if not LINE_EVENT_SUPPRESS_FRAGMENT_OF_LATCHED_TRACK:
